@@ -87,10 +87,6 @@ This prevents:
 
 ---
 
-Ah! Got it — you mean that **before you can use SAM-3**, you need to **accept the model license on the Hugging Face page and set up your account details**. Here’s a precise way to write it in your README/meta page:
-
----
-
 ## 🔑 Model Access (SAM-3 & DPT)
 
 1. Go to the **[SAM-3 model page](https://huggingface.co/facebook/sam3)**.

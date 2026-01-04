@@ -1,8 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 import tempfile
 import os
-import shutil
 import cv2
 import numpy as np
 from PIL import Image
@@ -10,11 +9,15 @@ import torch
 from scipy.ndimage import label
 import gc
 import json
+import zipfile
+from io import BytesIO
+
+# Import SAM-3 (kept globally for efficiency)
 from transformers import Sam3Model, Sam3Processor
 
 app = FastAPI(title="Chicken Weight Proxy Analyzer", version="1.0")
 
-# ------------------ YOUR UTILITY FUNCTIONS ------------------
+# ------------------ UTILITY FUNCTIONS ------------------
 def compute_iou(box1, box2):
     x1_min, y1_min, x1_max, y1_max = box1
     x2_min, y2_min, x2_max, y2_max = box2
@@ -64,74 +67,85 @@ def nms_with_containment(boxes, scores, iou_threshold=0.2):
         sorted_indices = remaining
     return keep
 
-# ------------------ GLOBAL MODEL LOADING (ONCE) ------------------
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
+# ------------------ GLOBAL: LOAD SAM-3 ONCE ------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"🧠 Using device: {device}")
 
 try:
-    model = Sam3Model.from_pretrained("facebook/sam3").to(device).eval()
-    processor = Sam3Processor.from_pretrained("facebook/sam3")
-    if device == "cuda":
-        model = model.half()
+    sam_processor = Sam3Processor.from_pretrained("facebook/sam3")
+    sam_model = Sam3Model.from_pretrained("facebook/sam3").to(device).eval()
+    if device.type == "cuda":
+        sam_model = sam_model.half()
         dtype = torch.float16
     else:
         dtype = torch.float32
+    print("✅ SAM-3 model loaded globally")
 except Exception as e:
-    model = None
-    processor = None
-    print(f"⚠️ Model loading failed: {e}")
+    sam_model = None
+    print(f"⚠️ SAM-3 failed to load: {e}")
 
-# ------------------ HEALTH CHECK ------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "device": device, "model_loaded": model is not None}
+    return {
+        "status": "ok",
+        "device": str(device),
+        "sam3_loaded": sam_model is not None
+    }
 
-# ------------------ ANALYSIS ENDPOINT ------------------
+# ------------------ MAIN ENDPOINT ------------------
 @app.post("/analyze_video")
-async def analyze_video(
-    video_file: UploadFile = File(...),
-    depth_file: UploadFile = File(None)  # Optional depth map
-):
-    if model is None:
-        raise HTTPException(status_code=500, detail="SAM3 model not loaded")
+async def analyze_video(video_file: UploadFile = File(...)):
+    if sam_model is None:
+        raise HTTPException(status_code=500, detail="SAM-3 model not loaded")
 
     if video_file.content_type != "video/mp4":
         raise HTTPException(status_code=400, detail="Only MP4 videos supported")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        # Save uploads
+        # Save input video
         video_path = os.path.join(tmp_dir, "input.mp4")
-        depth_path = os.path.join(tmp_dir, "depth.npy")
         with open(video_path, "wb") as f:
             f.write(await video_file.read())
-        if depth_file:
-            if depth_file.filename.endswith(".npy"):
-                with open(depth_path, "wb") as f:
-                    f.write(await depth_file.read())
-            else:
-                raise HTTPException(status_code=400, detail="Depth file must be .npy")
-        else:
-            raise HTTPException(status_code=400, detail="Depth file is required")
 
-        # Load depth
-        try:
-            depth_small = np.load(depth_path)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid depth file: {str(e)}")
-
-        # Read first frame to get resolution
+        # Read first frame
         cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise HTTPException(status_code=400, detail="Cannot open video")
         ret, first_frame = cap.read()
         if not ret:
-            raise HTTPException(status_code=400, detail="Cannot read video")
+            raise HTTPException(status_code=400, detail="Cannot read first frame")
         H, W = first_frame.shape[:2]
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         cap.release()
 
-        # Upsample depth
+        # -------------------------------------------------
+        # ✅ LOAD DPT → ESTIMATE DEPTH → UNLOAD IMMEDIATELY
+        # -------------------------------------------------
+        print("📦 Loading DPT for first-frame depth...")
+        from transformers import DPTFeatureExtractor, DPTForDepthEstimation
+        dpt_extractor = DPTFeatureExtractor.from_pretrained("Intel/dpt-large")
+        dpt_model = DPTForDepthEstimation.from_pretrained("Intel/dpt-large").to(device).eval()
+
+        first_frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+        image_pil = Image.fromarray(first_frame_rgb)
+
+        inputs = dpt_extractor(images=image_pil, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = dpt_model(**inputs)
+            depth_small = outputs.predicted_depth.squeeze().cpu().numpy()
+
         depth_full = cv2.resize(depth_small, (W, H), interpolation=cv2.INTER_CUBIC)
 
-        # Tiling
+        # 🔥 UNLOAD DPT TO FREE MEMORY
+        del dpt_model, dpt_extractor, inputs, outputs, depth_small, image_pil, first_frame_rgb, first_frame
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+        print("🧹 DPT model unloaded — VRAM freed for SAM-3")
+
+        # ------------------ SAM-3 PIPELINE ------------------
         TILE_ROWS, TILE_COLS = 3, 3
         tile_w = W // TILE_COLS
         tile_h = H // TILE_ROWS
@@ -150,24 +164,22 @@ async def analyze_video(
                 if x_end > x_start and y_end > y_start:
                     tiles.append({'x_start': x_start, 'y_start': y_start, 'x_end': x_end, 'y_end': y_end})
 
-        # Bounding box constraints
         MIN_WIDTH, MIN_HEIGHT = 0, 0
         MAX_WIDTH, MAX_HEIGHT = W // 4, H // 4
         MIN_ASPECT, MAX_ASPECT = 0.4, 2.5
 
-        # Tracking state
         next_track_id = 0
         active_tracks = {}
         iou_match_thresh = 0.3
         max_age = 5
         detections_log = []
 
-        # Output video
+        cap = cv2.VideoCapture(video_path)
         output_video_path = os.path.join(tmp_dir, "output.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        # Use H.264 for smaller file size (requires ffmpeg support)
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')  # or 'mp4v' if 'avc1' fails
         out = cv2.VideoWriter(output_video_path, fourcc, fps, (W, H))
 
-        cap = cv2.VideoCapture(video_path)
         frame_count = 0
         max_frames = 200
 
@@ -184,15 +196,15 @@ async def analyze_video(
                 x_start, y_start, x_end, y_end = tile_info['x_start'], tile_info['y_start'], tile_info['x_end'], tile_info['y_end']
                 tile_pil = image_pil.crop((x_start, y_start, x_end, y_end))
 
-                inputs = processor(images=tile_pil, text="Fowl", return_tensors="pt")
+                inputs = sam_processor(images=tile_pil, text="Fowl", return_tensors="pt")
                 for k, v in inputs.items():
                     if isinstance(v, torch.Tensor):
                         inputs[k] = v.to(device=device, dtype=dtype if v.dtype == torch.float32 else v.dtype)
 
                 with torch.no_grad():
-                    outputs = model(**inputs)
+                    outputs = sam_model(**inputs)
 
-                results = processor.post_process_instance_segmentation(
+                results = sam_processor.post_process_instance_segmentation(
                     outputs,
                     threshold=0.3,
                     mask_threshold=0.3,
@@ -235,7 +247,7 @@ async def analyze_video(
                     })
 
                 del inputs, outputs, results, tile_pil
-                if device == "cuda":
+                if device.type == "cuda":
                     torch.cuda.empty_cache()
                 gc.collect()
 
@@ -252,7 +264,6 @@ async def analyze_video(
             # Tracking
             current_dets = final_masks.copy()
             unmatched = list(range(len(current_dets)))
-            matched_ids = set()
 
             for track_id in list(active_tracks.keys()):
                 track = active_tracks[track_id]
@@ -268,7 +279,6 @@ async def analyze_video(
                     active_tracks[track_id]['confidence'] = current_dets[best_idx]['score']
                     active_tracks[track_id]['last_frame'] = frame_count
                     unmatched.remove(best_idx)
-                    matched_ids.add(track_id)
                 else:
                     if frame_count - active_tracks[track_id]['last_frame'] > max_age:
                         del active_tracks[track_id]
@@ -281,20 +291,15 @@ async def analyze_video(
                 }
                 next_track_id += 1
 
-            # Weight proxy & logging
+            # Weight proxy using depth_full
             frame_detections = []
             for track_id, track in active_tracks.items():
-                bbox = track['bbox']
-                x1, y1, x2, y2 = bbox
-
+                x1, y1, x2, y2 = track['bbox']
                 best_mask = None
-                best_iou = 0
                 for m in final_masks:
-                    iou = compute_iou(m['bbox'], bbox)
-                    if iou > best_iou and iou > 0.9:
-                        best_iou = iou
+                    if compute_iou(m['bbox'], (x1, y1, x2, y2)) > 0.9:
                         best_mask = m['mask']
-
+                        break
                 if best_mask is not None:
                     mask = best_mask
                 else:
@@ -327,7 +332,7 @@ async def analyze_video(
                 "tracks": frame_detections
             })
 
-            # Draw and write
+            # Draw and write frame
             display_frame = frame_bgr.copy()
             if final_masks:
                 combined_mask = np.zeros((H, W), dtype=bool)
@@ -343,13 +348,13 @@ async def analyze_video(
             frame_count += 1
 
             gc.collect()
-            if device == "cuda":
+            if device.type == "cuda":
                 torch.cuda.empty_cache()
 
         cap.release()
         out.release()
 
-        # Build JSON output
+        # Save JSON
         json_output = {
             "video_info": {
                 "filename": video_file.filename,
@@ -359,40 +364,24 @@ async def analyze_video(
                 "height": H
             },
             "depth_convention_note": (
-                "Depth values from monocular estimator (e.g., MiDaS): "
-                "higher values = closer to camera. "
-                "Weight proxy = mask_area_pixels / (median_depth^2 + 1e-6). "
-                "This proxy approximates physical size under pinhole camera model. "
-                "Values are relative (no real-world units)."
+                "Depth from DPT (monocular): higher = closer. "
+                "Weight proxy = mask_area_pixels / (median_depth² + 1e-6). Relative units."
             ),
             "counts_over_time": [
                 {"timestamp_sec": d["timestamp_sec"], "count": d["count"]}
                 for d in detections_log
             ],
-            "tracks_sample": [
-                {
-                    "track_id": t["id"],
-                    "start_frame": 0,
-                    "end_frame": frame_count - 1,
-                    "representative_box": t["bbox"],
-                    "avg_confidence": t["confidence"],
-                    "weight_proxy": t["weight_proxy"]
-                }
-                for t in detections_log[0]["tracks"][:5]
-            ] if detections_log else [],
             "weight_estimates": {
                 "per_bird": [
                     {
                         "track_id": t["id"],
                         "weight_proxy": t["weight_proxy"],
-                        "confidence": t["confidence"],
-                        "uncertainty": 0.15
+                        "confidence": t["confidence"]
                     }
                     for d in detections_log for t in d["tracks"]
                 ],
                 "aggregate": {
-                    "total_weight_proxy": sum(t["weight_proxy"] for d in detections_log for t in d["tracks"]),
-                    "uncertainty": 0.12
+                    "total_weight_proxy": sum(t["weight_proxy"] for d in detections_log for t in d["tracks"])
                 }
             }
         }
@@ -401,27 +390,15 @@ async def analyze_video(
         with open(json_path, "w") as f:
             json.dump(json_output, f, indent=2)
 
-        # Return both files
-        return JSONResponse(
-            content={
-                "message": "Analysis complete",
-                "video_url": "/download/video",
-                "json_url": "/download/json",
-                "summary": {
-                    "frames_processed": frame_count,
-                    "total_birds_detected": len(json_output["weight_estimates"]["per_bird"]),
-                    "total_weight_proxy": json_output["weight_estimates"]["aggregate"]["total_weight_proxy"]
-                }
-            }
+        # ------------------ RETURN ZIP ------------------
+        zip_buffer = BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(output_video_path, "output.mp4")
+            zf.write(json_path, "detections.json")
+        zip_buffer.seek(0)
+
+        return StreamingResponse(
+            zip_buffer,
+            media_type="application/zip",
+            headers={"Content-Disposition": "attachment; filename=chicken_analysis.zip"}
         )
-
-# ------------------ FILE DOWNLOAD ENDPOINTS ------------------
-@app.get("/download/video")
-def download_video():
-    # You'd need to pass the actual path—this is a simplified demo
-    # In production, use background tasks or store in shared storage
-    raise HTTPException(status_code=501, detail="Video download not implemented in this demo")
-
-@app.get("/download/json")
-def download_json():
-    raise HTTPException(status_code=501, detail="JSON download not implemented in this demo")

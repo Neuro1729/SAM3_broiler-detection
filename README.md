@@ -2,7 +2,7 @@
 
 High-resolution **broiler (chicken) detection and weight estimation** using **SAM-3 with tiling** and **DPT Transformer depth estimation** for dense poultry scenes and large farm images.
 
-This project demonstrates how **tiled SAM-3 segmentation + depth-aware size estimation** produces more reliable chicken weight proxies than full-image or YOLO-based methods.
+This project demonstrates how **tiled SAM-3 segmentation + depth-aware size estimation + hallucination control** produces far more reliable chicken measurements than full-image or YOLO-based pipelines.
 
 ---
 
@@ -46,7 +46,7 @@ to estimate how far each part of the chicken is from the camera.
 ### Pipeline
 1. SAM-3 segments each chicken  
 2. DPT predicts a depth map  
-3. The depth values inside each chicken mask are averaged and integrated  
+3. Depth values inside each chicken mask are integrated  
 4. This produces a **distance-aware size estimate**  
 5. This is mapped to chicken weight  
 
@@ -54,8 +54,6 @@ This corrects for:
 - Camera distance  
 - Perspective distortion  
 - Birds appearing smaller when farther away  
-
-So two chickens with the same pixel area but different distances do **not** get the same weight.
 
 ---
 
@@ -67,6 +65,25 @@ So two chickens with the same pixel area but different distances do **not** get 
 4. **DPT Transformer** predicts depth  
 5. Mask + depth → **distance-corrected size**  
 6. Size → **weight estimation**
+
+---
+
+## 🛡️ Hallucination & Outlier Control
+
+Large vision models sometimes **hallucinate objects**, produce **ghost masks**, or generate **wrong bounding boxes**.
+
+We handle this by:
+
+- Removing masks with abnormal area or shape  
+- Filtering out depth-inconsistent detections  
+- Using IoU-based merging across tiles  
+- Rejecting outliers that do not match poultry geometry  
+
+This prevents:
+- False chickens  
+- Floating masks  
+- Broken bounding boxes  
+- Incorrect weight estimates  
 
 ---
 
@@ -83,3 +100,58 @@ Run this once:
 
 from huggingface_hub import login
 login(token="YOUR_HUGGINGFACE_TOKEN")
+```
+# 🔮 Improvements & Roadmap
+
+## 1️⃣ Temporal Tracking with SAM-3 Video
+
+**Goal:** Enable robust, identity-preserving chicken tracking across video frames with minimal GPU usage.
+
+### Usage
+```python
+from transformers import Sam3VideoModel, Sam3VideoProcessor
+```
+
+### Pipeline
+1. Run **tiled SAM-3** on the first frame  
+2. Extract the **best segmentation masks**  
+3. **Track all chickens** using **SAM-3 Video**
+
+### Benefits
+- ✅ Seamless, temporally consistent video output  
+- ✅ Stable chicken identities across frames  
+- ✅ Much lower GPU memory and compute cost  
+- ✅ Enables real-time monitoring on modest hardware (e.g., Colab T4)
+
+---
+
+## 2️⃣ Mixture of Prompts
+
+**Goal:** Improve detection robustness under varying farm conditions.
+
+### Prompt Ensemble
+```python
+prompts = ["broiler", "chicken", "fowl", "poultry"]
+```
+
+### Improvements
+- 🛡️ Higher detection robustness across breeds and sizes  
+- 👁️ Better handling of partial occlusions  
+- 🌞 Enhanced recall under diverse lighting and camera angles  
+
+---
+
+## 3️⃣ Fast & Quantized SAM-3
+
+**Goal:** Optimize for real-world edge deployment on farm cameras.
+
+### Techniques
+- Use **FAST-SAM** for speed  
+- Apply **quantized SAM-3** (INT8 or 4-bit)  
+- Combine with **tiling** for high-resolution inputs
+
+### Capabilities
+- 📦 Runs on **edge devices** (e.g., Jetson, Raspberry Pi with Coral)  
+- 📹 Enables **real-time processing** on live farm cameras  
+- 💰 Supports **low-cost GPU deployment** (ideal for Colab or budget cloud instances)  
+- 🎥 Output compatible with `.mp4` (H.264) for small file sizes and broad compatibility

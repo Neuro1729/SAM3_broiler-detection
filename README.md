@@ -2,7 +2,7 @@
 
 High-resolution **broiler (chicken) detection and weight estimation** using **SAM-3 with tiling** and **DPT Transformer depth estimation** for dense poultry scenes and large farm images.
 
-This project demonstrates how **tiled SAM-3 segmentation + depth-aware area estimation** produces much more reliable chicken size and weight proxies than full-image segmentation alone.
+This project demonstrates how **tiled SAM-3 segmentation + depth-aware size estimation** produces more reliable chicken weight proxies than full-image or YOLO-based methods.
 
 ---
 
@@ -27,7 +27,10 @@ By dividing the image into smaller tiles (3×3, 4×4, etc.):
 [![3 x 3 Tiling SAM](https://img.youtube.com/vi/dKcmJSND6qQ/0.jpg)](https://youtu.be/dKcmJSND6qQ)
 
 ### 4 × 4 Tiling – SAM-3 Detection
-[![4 x 4 Tiling SAM](https://img.youtube.com/vi/J-06fdpUQFU/0.jpg)](https://youtu.be/J-06fdpUQFU)
+[![4 x 4 Tiling SAM](https://img.youtube.com/vi/YA9dF6aVD7Y/0.jpg)](https://youtu.be/YA9dF6aVD7Y)
+
+### YOLO-Based Baseline
+[![YOLO Baseline](https://img.youtube.com/vi/J-06fdpUQFU/0.jpg)](https://youtu.be/J-06fdpUQFU)
 
 ---
 
@@ -38,19 +41,21 @@ We do **not** estimate weight from pixel area alone.
 We use:
 
 **DPT Transformer (Depth Prediction Transformer)**  
-to generate a **depth map** of the scene.
+to estimate how far each part of the chicken is from the camera.
 
 ### Pipeline
 1. SAM-3 segments each chicken  
-2. DPT predicts depth  
-3. Depth is integrated inside each chicken mask  
-4. This gives a **volume-aware area proxy**  
-5. That proxy is mapped to chicken weight  
+2. DPT predicts a depth map  
+3. The depth values inside each chicken mask are averaged and integrated  
+4. This produces a **distance-aware size estimate**  
+5. This is mapped to chicken weight  
 
-This compensates for:
+This corrects for:
 - Camera distance  
 - Perspective distortion  
-- Body thickness  
+- Birds appearing smaller when farther away  
+
+So two chickens with the same pixel area but different distances do **not** get the same weight.
 
 ---
 
@@ -60,8 +65,8 @@ This compensates for:
 2. Each tile runs through **SAM-3**  
 3. Masks are merged using IoU filtering  
 4. **DPT Transformer** predicts depth  
-5. Mask × depth → **volume proxy**  
-6. Volume proxy → **weight estimation**
+5. Mask + depth → **distance-corrected size**  
+6. Size → **weight estimation**
 
 ---
 
@@ -70,7 +75,7 @@ This compensates for:
 You do **not** need to manually download weights.  
 SAM-3 and DPT models are pulled automatically from Hugging Face after login.
 
-Run this once in Colab or your environment:
+Run this once:
 
 ```python
 !pip install git+https://github.com/huggingface/transformers.git

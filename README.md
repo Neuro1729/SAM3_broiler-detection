@@ -87,20 +87,29 @@ This prevents:
 
 ---
 
-## 🔑 Model Access (No Manual Weight Download)
+Ah! Got it — you mean that **before you can use SAM-3**, you need to **accept the model license on the Hugging Face page and set up your account details**. Here’s a precise way to write it in your README/meta page:
 
-You do **not** need to manually download weights.  
-SAM-3 and DPT models are pulled automatically from Hugging Face after login.
+---
 
-Run this once:
+## 🔑 Model Access (SAM-3 & DPT)
+
+1. Go to the **[SAM-3 model page](https://huggingface.co/facebook/sam3)**.
+2. Read and **accept the model license / usage terms**.
+3. Make sure your Hugging Face account is logged in and verified.
+4. Generate a **Hugging Face token** (Settings → Access Tokens).
+
+Once done, you can log in in your Python environment:
 
 ```python
-!pip install git+https://github.com/huggingface/transformers.git
 !pip install huggingface_hub --upgrade
-
 from huggingface_hub import login
+
 login(token="YOUR_HUGGINGFACE_TOKEN")
 ```
+
+* After login, **SAM-3 and DPT models are automatically pulled** from Hugging Face on first use.
+* This works for both **local GPUs** and cloud environments like Colab.
+
 # 🔮 Improvements & Roadmap
 
 ## 1️⃣ Temporal Tracking with SAM-3 Video
@@ -155,3 +164,64 @@ prompts = ["broiler", "chicken", "fowl", "poultry"]
 - 📹 Enables **real-time processing** on live farm cameras  
 - 💰 Supports **low-cost GPU deployment** (ideal for Colab or budget cloud instances)  
 - 🎥 Output compatible with `.mp4` (H.264) for small file sizes and broad compatibility
+
+
+
+## Run Chicken Weight Proxy Analyzer
+
+1. **Clone the repo**
+
+```bash
+git clone https://github.com/Neuro1729/SAM3_broiler-detection.git
+cd SAM3_broiler-detection
+````
+
+2. **Create a virtual environment (recommended)**
+
+```bash
+python -m venv venv
+source venv/bin/activate   # Linux/macOS
+venv\Scripts\activate      # Windows
+```
+
+3. **Install dependencies**
+
+ ```bash
+# Install FastAPI, video/image libraries, Torch, and SciPy
+pip install fastapi uvicorn opencv-python-headless pillow torch torchvision scipy
+
+# Install the latest Transformers from GitHub (needed for SAM-3 / DPT)
+pip install git+https://github.com/huggingface/transformers.git
+
+# Upgrade Hugging Face Hub
+pip install huggingface_hub --upgrade
+```
+
+> ⚠️ For GPU acceleration, install the correct `torch` version with CUDA from [PyTorch website](https://pytorch.org/get-started/locally/).
+
+4. **Run the API**
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+> `main` is the name of the Python file (replace with your filename if different).
+
+5. **Test the API**
+
+* Health check:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+* Analyze a video:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/analyze_video" -F "video_file=@example.mp4" --output chicken_analysis.zip
+```
+
+This will return a ZIP containing:
+
+* `output.mp4` → video with masks and boxes
+* `detections.json` → per-frame detection & weight proxy data
